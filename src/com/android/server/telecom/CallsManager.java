@@ -29,6 +29,7 @@ import android.os.Trace;
 import android.provider.CallLog.Calls;
 import android.provider.Settings;
 import android.telecom.CallAudioState;
+import android.provider.Settings;
 import android.telecom.Conference;
 import android.telecom.Connection;
 import android.telecom.DisconnectCause;
@@ -48,6 +49,7 @@ import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.telephony.TelephonyProperties;
 import com.android.internal.telephony.util.BlacklistUtils;
 import com.android.internal.util.IndentingPrintWriter;
+import com.android.server.telecom.ui.ViceNotificationImpl;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -148,6 +150,7 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
     private final MissedCallNotifier mMissedCallNotifier;
     private final BlacklistCallNotifier mBlacklistCallNotifier;
     private final CallInfoProvider mCallInfoProvider;
+    private final ViceNotificationImpl mViceNotificationImpl;
     private final Set<Call> mLocallyDisconnectingCalls = new HashSet<>();
     private final Set<Call> mPendingCallsToDisconnect = new HashSet<>();
     /* Handler tied to thread in which CallManager was initialized. */
@@ -173,7 +176,6 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
     private String mLchSub = null;
 
     private InCallTonePlayer mLocalCallReminderTonePlayer = null;
-    private InCallTonePlayer mSupervisoryCallHoldTonePlayer = null;
     private String mSubInConversation = null;
 
     private Runnable mStopTone;
@@ -192,7 +194,8 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
             ProximitySensorManagerFactory proximitySensorManagerFactory,
             InCallWakeLockControllerFactory inCallWakeLockControllerFactory,
             BlacklistCallNotifier blacklistCallNotifier,
-            CallInfoProvider callInfoProvider) {
+            CallInfoProvider callInfoProvider,
+            ViceNotifier viceNotifier) {
         mContext = context;
         mLock = lock;
         mContactsAsyncHelper = contactsAsyncHelper;
@@ -222,6 +225,7 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
         mCallInfoProvider = callInfoProvider;
 
         dsdaSupportsLch = mContext.getResources().getBoolean(R.bool.dsda_supports_lch);
+        mViceNotificationImpl = viceNotifier.create(mContext, this);
 
         mListeners.add(statusBarNotifier);
         mListeners.add(mCallLogManager);
@@ -235,6 +239,7 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
         mListeners.add(mDtmfLocalTonePlayer);
         mListeners.add(mHeadsetMediaButton);
         mListeners.add(mProximitySensorManager);
+        mListeners.add(mViceNotificationImpl);
 
         mListeners.add(mCallInfoProvider);
 
@@ -250,6 +255,10 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
         mMissedCallNotifier.clearMissedCallNotifications();
         mMissedCallNotifier.updateOnStartup(
                 mLock, this, mContactsAsyncHelper, mCallerInfoAsyncQueryFactory);
+    }
+
+    ViceNotificationImpl getViceNotificationImpl() {
+        return mViceNotificationImpl;
     }
 
     public void setRespondViaSmsManager(RespondViaSmsManager respondViaSmsManager) {
@@ -902,7 +911,7 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
      * @param videoState The video state in which to answer the call.
      */
     void answerCall(final Call call, final int videoState) {
-        answerCall(call, videoState, TelecomManager.CALL_WAITING_RESPONSE_NO_POPUP_END_CALL);
+        answerCall(call, videoState, TelecomManager.CALL_WAITING_RESPONSE_NO_POPUP_HOLD_CALL);
     }
 
     /**
@@ -1420,6 +1429,16 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
         return count;
     }
 
+    int getNumTopLevelCalls() {
+        int count = 0;
+        for (Call call : mCalls) {
+            if (call.getParentCall() == null) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     Call getOutgoingCall() {
         return getFirstCallWithState(OUTGOING_CALL_STATES);
     }
@@ -1697,7 +1716,7 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
                 }
 
                 // If only call in call list is held call it's also a foreground call
-                if (mCalls.size() == 1 && call.getState() == CallState.ON_HOLD) {
+                if (getNumTopLevelCalls() == 1 && call.getState() == CallState.ON_HOLD) {
                     newForegroundCall = call;
                 }
 
@@ -1730,7 +1749,7 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
                 }
 
                 // If only call in call list is held call it's also a foreground call
-                if (mCalls.size() == 1 && call.getState() == CallState.ON_HOLD) {
+                if (getNumTopLevelCalls() == 1 && call.getState() == CallState.ON_HOLD) {
                     newForegroundCall = call;
                 }
 
@@ -2337,17 +2356,7 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
                     mPlayerFactory.createPlayer(InCallTonePlayer.TONE_HOLD_RECALL);
             mLocalCallReminderTonePlayer.start();
         }
-        if (sSupervisoryCallHoldToneConfig.equals("inband")) {
-            // if "persist.radio.sch_tone" is set to "inband", play inband supervisory
-            // call hold tone. if set to "dtmf", play the SCH tones
-            // over DTMF, don't play SCH tones for anyother value.
-            if (mSupervisoryCallHoldTonePlayer == null) {
-                Log.d(this, " startDsdaInCallTones: Supervisory call hold tone ");
-                mSupervisoryCallHoldTonePlayer =
-                        mPlayerFactory.createPlayer(InCallTonePlayer.TONE_SUPERVISORY_CH);
-                mSupervisoryCallHoldTonePlayer.start();
-            }
-        } else if (sSupervisoryCallHoldToneConfig.equals("dtmf")) {
+        if (sSupervisoryCallHoldToneConfig.equals("dtmf")) {
             Log.d(this, " startDsdaInCallTones: Supervisory call hold tone over dtmf ");
             playLchDtmf();
         }
@@ -2363,11 +2372,6 @@ public class CallsManager extends Call.ListenerBase implements VideoProviderProx
             Log.d(this, " stopMSimInCallTones: local call hold reminder tone ");
             mLocalCallReminderTonePlayer.stopTone();
             mLocalCallReminderTonePlayer = null;
-        }
-        if (mSupervisoryCallHoldTonePlayer != null) {
-            Log.d(this, " stopMSimInCallTones: Supervisory call hold tone ");
-            mSupervisoryCallHoldTonePlayer.stopTone();
-            mSupervisoryCallHoldTonePlayer = null;
         }
         if (sSupervisoryCallHoldToneConfig.equals("dtmf")) {
             Log.d(this, " stopMSimInCallTones: stop SCH Dtmf call hold tone ");
